@@ -73,10 +73,20 @@ function Get-PluginStatus([string]$pluginName) {
 }
 
 function Get-SpacethemeStatus {
-    $themeDir = "C:\Program Files (x86)\Steam\millennium\themes\Steam"
-    $cssFile  = Join-Path $themeDir "src\css\regular.css"
+    $themesRoot = if ($steam) { Join-Path $steam "millennium\themes" } else { "C:\Program Files (x86)\Steam\millennium\themes" }
+    if (-not (Test-Path $themesRoot)) { return "[not found]" }
 
-    if (Test-Path $cssFile) { return "[found]" }
+    foreach ($themeDir in @((Join-Path $themesRoot "Steam")) + @(Get-ChildItem -Path $themesRoot -Directory -ErrorAction SilentlyContinue | ForEach-Object { $_.FullName })) {
+        $skinFile = Join-Path $themeDir "skin.json"
+        $metaFile = Join-Path $themeDir "metadata.json"
+
+        if (Test-Path $metaFile) {
+            $meta = try { Get-Content $metaFile -Raw | ConvertFrom-Json } catch { $null }
+            if ($meta -and $meta.owner -eq "SpaceTheme" -and $meta.repo -eq "Steam") { return "[found]" }
+        }
+        if ((Split-Path $themeDir -Leaf) -eq "Steam" -and (Test-Path $skinFile)) { return "[found]" }
+    }
+
     return "[not found]"
 }
 
@@ -216,24 +226,65 @@ if ($Branch -eq 3) {
     Log "AUX"  "Credit: waike (waike.dev)"
     Blank
 
-    $themesRoot = "C:\Program Files (x86)\Steam\millennium\themes"
-    $themeDir   = Join-Path $themesRoot "Steam"
+    function Get-MillenniumThemeRoots {
+        $roots = New-Object System.Collections.Generic.List[string]
+        if ($steam) { $roots.Add((Join-Path $steam "millennium\themes")) }
+        $roots.Add("C:\Program Files (x86)\Steam\millennium\themes")
+        $roots.Add("C:\Program Files\Steam\millennium\themes")
 
-    if (-not (Test-Path $themesRoot)) {
-        Log "ERR" "Millennium themes folder not found: $themesRoot"
+        return $roots | Where-Object { $_ -and (Test-Path $_) } | Select-Object -Unique
+    }
+
+    function Test-SpacethemeSteamTheme([string]$Path) {
+        if (-not (Test-Path $Path)) { return $false }
+
+        $metaFile = Join-Path $Path "metadata.json"
+        if (Test-Path $metaFile) {
+            $meta = try { Get-Content $metaFile -Raw | ConvertFrom-Json } catch { $null }
+            if ($meta -and $meta.owner -eq "SpaceTheme" -and $meta.repo -eq "Steam") { return $true }
+        }
+
+        return (Test-Path (Join-Path $Path "skin.json")) -and
+               (Test-Path (Join-Path $Path "src\css"))
+    }
+
+    function Find-SpacethemeSteamTheme {
+        foreach ($root in Get-MillenniumThemeRoots) {
+            $exact = Join-Path $root "Steam"
+            if (Test-SpacethemeSteamTheme $exact) { return $exact }
+
+            foreach ($dir in Get-ChildItem -Path $root -Directory -ErrorAction SilentlyContinue) {
+                if (Test-SpacethemeSteamTheme $dir.FullName) { return $dir.FullName }
+            }
+        }
+        return $null
+    }
+
+    function Remove-SpacethemePluginBlock([string]$Content) {
+        $patched = $Content
+
+        # Steam theme currently injects this block into several TargetCss files.
+        $blockPattern = '(?is)\s*/\*\s*&\s*Ban\s+piracy\s+plugins\s*\*/\s*(?:[^{}]*\{[^{}]*\}\s*){1,4}'
+        $patched = [regex]::Replace($patched, $blockPattern, "`r`n")
+
+        # Older/newer variants can omit the heading, so remove the blocker rules by selector/body shape too.
+        $rulePattern = '(?is)\s*(?:[^{;]*(?:luatools|manilua|lumea|data-manilua)[^{;]*)+\{(?=[^{}]*(?:display\s*:\s*none|content\s*:))[^{}]*\}\s*'
+        $patched = [regex]::Replace($patched, $rulePattern, "`r`n")
+
+        return $patched
+    }
+
+    $themeDir = Find-SpacethemeSteamTheme
+    if (-not $themeDir) {
+        Log "ERR" "SpaceTheme/Steam was not found in any Millennium themes folder."
+        Log "AUX" "Checked: $((Get-MillenniumThemeRoots) -join ', ')"
         Read-Host "Press Enter to exit"
         exit 1
     }
 
-    if (-not (Test-Path $themeDir)) {
-        Log "ERR" "Theme folder named 'Steam' was not found at: $themeDir"
-        Read-Host "Press Enter to exit"
-        exit 1
-    }
-
-    $cssFile = Join-Path $themeDir "src\css\regular.css"
-    if (-not (Test-Path $cssFile)) {
-        Log "ERR" "Theme CSS file was not found: $cssFile"
+    $cssFiles = @(Get-ChildItem -Path $themeDir -Recurse -File -Filter "*.css" -ErrorAction SilentlyContinue)
+    if ($cssFiles.Count -eq 0) {
+        Log "ERR" "No CSS files found in theme: $themeDir"
         Read-Host "Press Enter to exit"
         exit 1
     }
@@ -250,15 +301,22 @@ if ($Branch -eq 3) {
     Get-Process -Name "steam","steamwebhelper","steamservice","steamerrorreporter" -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
     Start-Sleep -Seconds 1
 
-    $content = Get-Content $cssFile -Raw
-    $pattern = '(?s)/\*\s*\n?\s*& Ban piracy plugins.*?color: #fff !important;\s*\}'
+    $patchedCount = 0
+    foreach ($cssFile in $cssFiles) {
+        $content = Get-Content $cssFile.FullName -Raw
+        if ($null -eq $content) { $content = "" }
+        $newContent = Remove-SpacethemePluginBlock $content
+        if ($newContent -ne $content) {
+            Set-Content $cssFile.FullName -Value $newContent -NoNewline -Encoding UTF8
+            $patchedCount++
+            Log "OK" "Patched $($cssFile.FullName.Substring($themeDir.Length + 1))"
+        }
+    }
 
-    if ($content -match $pattern) {
-        $content = $content -replace $pattern, '/* Retard owner tried to block luatools.. lmao */'
-        Set-Content $cssFile -Value $content -NoNewline -Encoding UTF8
-        Log "OK" "Patched regular.css"
+    if ($patchedCount -gt 0) {
+        Log "OK" "Removed plugin blocker from $patchedCount CSS file(s)."
     } else {
-        Log "INFO" "Nothing to patch in regular.css — block may already be removed."
+        Log "INFO" "Nothing to patch - blocker may already be removed."
     }
 
     Blank
@@ -270,7 +328,7 @@ if ($Branch -eq 3) {
 #### Branch 4: Steam Offline Fix (by waike - waike.dev) ####
 if ($Branch -eq 4) {
     Log "INFO" "Steam Offline Fix"
-    Log "AUX"  "Steamtools sometimes forces offline mode — this attempts to fix the loading icon issue."
+    Log "AUX"  "Steamtools sometimes forces offline mode - this attempts to fix the loading icon issue."
     Log "AUX"  "Credit: waike (waike.dev)"
     Blank
 
@@ -288,7 +346,7 @@ if ($Branch -eq 4) {
         if ($content -match '"WantsOfflineMode"\s+"1"') {
             $newContent = $content -replace '("WantsOfflineMode"\s+)"1"', '$1"0"'
             Set-Content -Path $loginUsersPath -Value $newContent -Encoding UTF8
-            Log "OK" "Fixed — WantsOfflineMode set to 0 in loginusers.vdf"
+            Log "OK" "Fixed - WantsOfflineMode set to 0 in loginusers.vdf"
         } else {
             Log "INFO" "Steam was not set to offline mode, nothing changed."
         }
@@ -388,7 +446,7 @@ if ($Branch -eq 5) {
             Remove-Item $pluginPath -Recurse -Force
             Log "OK" "$upperName folder removed"
         } else {
-            Log "WARN" "Plugin folder for '$name' not found — already uninstalled?"
+            Log "WARN" "Plugin folder for '$name' not found - already uninstalled?"
         }
 
         $configPath = Join-Path $steam "ext/config.json"
@@ -432,7 +490,7 @@ if ($Branch -eq 5) {
         foreach ($f in $foundDlls) {
             $t = Join-Path $steam $f
             try   { Remove-Item -Path $t -Force -ErrorAction Stop; Log "OK" "Removed: $f" }
-            catch { Log "ERR" "Could not remove $f — try running as Administrator" }
+            catch { Log "ERR" "Could not remove $f - try running as Administrator" }
         }
 
         if ($RemoveLuas) {
@@ -444,7 +502,7 @@ if ($Branch -eq 5) {
 
         if ($stAppExists) {
             try   { Remove-Item -Path $stAppDir -Recurse -Force -ErrorAction Stop; Log "OK" "Removed: $stAppDir" }
-            catch { Log "ERR" "Could not remove $stAppDir — try running as Administrator" }
+            catch { Log "ERR" "Could not remove $stAppDir - try running as Administrator" }
         }
 
         if ($stRegExists) {
@@ -485,14 +543,14 @@ if ($Branch -eq 5) {
         foreach ($f in $foundFiles) {
             $t = Join-Path $steam $f
             try   { Remove-Item -Path $t -Force -ErrorAction Stop; Log "OK" "Removed: $f" }
-            catch { Log "ERR" "Could not remove $f — try running as Administrator" }
+            catch { Log "ERR" "Could not remove $f - try running as Administrator" }
         }
 
         foreach ($d in $foundDirs) {
             if ($d -eq "plugins" -and $KeepPlugins) { Log "AUX" "Skipping plugins folder"; continue }
             $t = Join-Path $steam $d
-            try   { Remove-Item -Path $t -Recurse -Force -ErrorAction Stop; Log "OK" "Removed: $d\" }
-            catch { Log "ERR" "Could not remove $d\ — try running as Administrator" }
+            try   { Remove-Item -Path $t -Recurse -Force -ErrorAction Stop; Log "OK" "Removed: $d" }
+            catch { Log "ERR" "Could not remove $d - try running as Administrator" }
         }
 
         Log "OK" "Millennium uninstalled"
@@ -606,7 +664,7 @@ if ($Branch -eq 6) {
     )
 
     if (-not $IsAdmin) {
-        Log "WARN" "Not running as admin — Windows Defender changes won't run."
+        Log "WARN" "Not running as admin - Windows Defender changes won't run."
         Blank
         $choice = Read-Host "Are you sure you want to continue? (Y/N)"
         if ($choice -notin @("Y","y")) {
@@ -1491,7 +1549,7 @@ if ($Branch -eq 8) {
                     [Security.Principal.WindowsBuiltInRole]::Administrator
                 )
                 if (-not $IsAdmin) {
-                    Log "WARN" "Not running as Administrator — the fix may not work correctly."
+                    Log "WARN" "Not running as Administrator - the fix may not work correctly."
                     Log "WARN" "Re-launch this script with Ctrl+Shift+Enter for best results."
                     Blank
                     $adminChoice = Read-Host "Continue anyway? (Y/N)"
@@ -1634,7 +1692,7 @@ if ($Branch -eq 9) {
             Write-Host "Launch CloudRedirect (already installed)"
         } else {
             Write-Host "Launch CloudRedirect " -NoNewline
-            Write-Host "(not installed — download first)" -ForegroundColor DarkGray
+            Write-Host "(not installed - download first)" -ForegroundColor DarkGray
         }
 
         Blank
@@ -1795,7 +1853,7 @@ if ($Branch -eq 10) {
         Blank
     }
 
-    # Locate Steam path — tries all three registry locations like the rest of the script
+    # Locate Steam path - tries all three registry locations like the rest of the script
     $b10SteamPath = (Get-ItemProperty "HKLM:\SOFTWARE\WOW6432Node\Valve\Steam" -ErrorAction SilentlyContinue).InstallPath
     if (-not $b10SteamPath) { $b10SteamPath = (Get-ItemProperty "HKLM:\SOFTWARE\Valve\Steam" -ErrorAction SilentlyContinue).InstallPath }
     if (-not $b10SteamPath) { $b10SteamPath = (Get-ItemProperty "HKCU:\Software\Valve\Steam" -ErrorAction SilentlyContinue).SteamPath }
@@ -1891,7 +1949,7 @@ if ($Branch -eq 10) {
                             Remove-Item -Path $f -Force -Recurse -ErrorAction Stop
                             Log "OK" "Removed: $(Split-Path $f -Leaf)"
                         } catch {
-                            Log "WARN" "Could not remove: $(Split-Path $f -Leaf) — $($_.Exception.Message)"
+                            Log "WARN" "Could not remove: $(Split-Path $f -Leaf) - $($_.Exception.Message)"
                         }
                     }
                 }
@@ -1940,10 +1998,10 @@ if ($Branch -eq 10) {
                                 Invoke-RestMethod -Uri $uri -OutFile $dest -ErrorAction SilentlyContinue
                                 Log "OK" "$dllName downloaded (after backup)."
                             } catch {
-                                Log "WARN" "Could not download $dllName — $($_.Exception.Message)"
+                                Log "WARN" "Could not download $dllName - $($_.Exception.Message)"
                             }
                         } else {
-                            Log "WARN" "Could not download $dllName — $($_.Exception.Message)"
+                            Log "WARN" "Could not download $dllName - $($_.Exception.Message)"
                         }
                     }
                 }
@@ -1970,7 +2028,7 @@ if ($Branch -eq 10) {
                     Start-Process "steam://"
                     Log "OK" "Steam launched. Log in to complete activation."
                 } else {
-                    Log "WARN" "steam.exe not found at expected path — launch Steam manually."
+                    Log "WARN" "steam.exe not found at expected path - launch Steam manually."
                 }
 
                 Blank
